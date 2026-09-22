@@ -30,8 +30,6 @@ RULE_ORDER = [
     "PATH_DEPTH",
 ]
 
-MAX_PATH_DEPTH = 20
-
 
 def dns_in_subtree(host: str, constraint: str) -> bool:
     host = host.lower().rstrip(".")

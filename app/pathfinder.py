@@ -9,14 +9,22 @@ unique required winner (fewest certs, lexicographically smallest
 leaf→root fingerprint sequence). Revocation is checked on every complete
 anchor path, never after fixing one shortest chain.
 
+There is no fixed depth cap: deepening continues until a pass explores the
+whole reachable simple-path space without the depth bound cutting any viable
+branch. Cycles are blocked with the on-path set, so simple paths are bounded
+by the number of reachable certificates and the loop is guaranteed to
+terminate — on cyclic, cross-signed and arbitrarily deep graphs alike. A
+rejection is therefore issued only after every reachable candidate branch has
+been exhausted, and the proof covers all of them.
+
 Exploration is lazy: from a certificate only name/AKI-compatible issuers are
-considered, so 100k unrelated certificates add essentially zero work; cycles
-are blocked with the on-path set, and all edge results are memoized.
+considered, so 100k unrelated certificates add essentially zero work; all
+edge results are memoized. The DFS uses an explicit stack, so chains longer
+than the interpreter recursion limit are handled as well.
 """
 from __future__ import annotations
 
 from .chain import (
-    MAX_PATH_DEPTH,
     check_eku,
     check_name_constraints,
     check_path_len,
@@ -91,11 +99,19 @@ class PathFinder:
                     "rejection_proof": None}
 
         winner = None
-        for depth in range(1, MAX_PATH_DEPTH + 1):
+        depth = 1
+        while True:
             self._last_good = None
-            if self._dfs(leaf_fp, (leaf_fp,), depth):
+            found, truncated = self._dfs(leaf_fp, depth)
+            if found:
                 winner = self._last_good
                 break
+            if not truncated:
+                # The depth bound never cut a viable branch, so this pass
+                # already explored every reachable simple path; deeper
+                # passes would retrace the same space and find nothing new.
+                break
+            depth += 1
         if winner is not None:
             return {"status": "ACCEPTED", "reason": None,
                     "selected_path": winner["path"],
@@ -136,23 +152,46 @@ class PathFinder:
                 out.append(ip)
         return sorted(out)
 
-    def _dfs(self, fp: str, stack: tuple[str, ...], remaining: int) -> bool:
-        for ip in self._static_parents(fp):
-            if ip in stack:
-                self.edge_failures.setdefault((fp, ip), {"rule": "LOOP"})
-                continue
-            nf = self._node_intrinsic(ip, as_issuer=True)
-            if nf is not None:
-                self.edge_failures.setdefault((fp, ip), nf)
-                continue
-            if ip in self.anchors:
-                path = stack + (ip,)
-                if self._complete_path(path) is None:
-                    return True
-                continue
-            if remaining > 1 and self._dfs(ip, stack + (ip,), remaining - 1):
-                return True
-        return False
+    def _dfs(self, leaf_fp: str, depth: int) -> tuple[bool, bool]:
+        """One iterative-deepening pass, explicit stack (no recursion limit).
+
+        Enumerates simple paths from the leaf in ascending fingerprint order,
+        checking every anchor-terminated path of up to ``depth`` edges against
+        the whole-path gates. Returns ``(found, truncated)``: ``found`` when a
+        passing path was recorded in ``self._last_good``; ``truncated`` when
+        the depth bound cut at least one otherwise viable non-anchor branch,
+        meaning a deeper pass could still discover new paths.
+        """
+        truncated = False
+        # Frame: [node fingerprint, path tuple, remaining depth, parent iter].
+        frames: list[list] = [[leaf_fp, (leaf_fp,), depth,
+                               iter(self._static_parents(leaf_fp))]]
+        while frames:
+            fp, path, remaining, it = frames[-1]
+            descended = False
+            for ip in it:
+                if ip in path:
+                    self.edge_failures.setdefault((fp, ip), {"rule": "LOOP"})
+                    continue
+                nf = self._node_intrinsic(ip, as_issuer=True)
+                if nf is not None:
+                    self.edge_failures.setdefault((fp, ip), nf)
+                    continue
+                if ip in self.anchors:
+                    if self._complete_path(path + (ip,)) is None:
+                        return True, truncated
+                    continue
+                if remaining > 1:
+                    frames.append([ip, path + (ip,), remaining - 1,
+                                   iter(self._static_parents(ip))])
+                    descended = True
+                    break
+                # A viable non-anchor branch extends past the depth bound:
+                # the reachable space is not exhausted yet.
+                truncated = True
+            if not descended:
+                frames.pop()
+        return False, truncated
 
     def _complete_path(self, path: tuple[str, ...]):
         rev_fail, rev_details = self._revocation_gate(list(path))
@@ -218,9 +257,7 @@ class PathFinder:
         parents_of: dict[str, set[str]] = {}
         for (c, p) in self.edges_seen:
             parents_of.setdefault(c, set()).add(p)
-        # Reverse reachability to any anchor over valid static edges.
-        can: set[str] = set(a for a in self.anchors if any(
-            a in ps for ps in parents_of.values()) or a == next(iter(parents_of), None))
+        # Reverse reachability from any anchor over explored edges.
         can = set(self.anchors)
         children_of: dict[str, set[str]] = {}
         for c, ps in parents_of.items():
