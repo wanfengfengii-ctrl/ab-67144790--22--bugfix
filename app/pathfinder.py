@@ -1,22 +1,28 @@
 """Whole-graph path construction with deterministic selection and a
 complete rejection proof.
 
-Search is iterative deepening on certificate count; at a fixed depth issuer
-choices are visited in ascending fingerprint order. The first chain that
-passes *every* gate (signature, validity, hierarchy, pathLen, name
-constraints, policy, EKU, bitemporal revocation) at the smallest depth is the
-unique required winner (fewest certs, lexicographically smallest
-leaf→root fingerprint sequence). Revocation is checked on every complete
-anchor path, never after fixing one shortest chain.
+Search is best-first over simple paths, ordered by (certificate count,
+leaf->root fingerprint sequence): exactly the iterative-deepening order,
+but with no artificial depth cap. The first chain that passes *every* gate
+(signature, validity, hierarchy, pathLen, name constraints, policy, EKU,
+bitemporal revocation) in that order is the unique required winner (fewest
+certs, lexicographically smallest leaf->root fingerprint sequence).
+Revocation is checked on every complete anchor path, never after fixing one
+shortest chain.
 
 Exploration is lazy: from a certificate only name/AKI-compatible issuers are
-considered, so 100k unrelated certificates add essentially zero work; cycles
-are blocked with the on-path set, and all edge results are memoized.
+considered, so 100k unrelated certificates add essentially zero work. Cycles
+are blocked with the on-path set, so every candidate path is finite and the
+search terminates on cyclic and cross-signed graphs; NO_PATH_TO_ANCHOR is
+reported only after the reachable candidate space is truly exhausted, and
+the rejection proof covers every reachable branch. All edge and node
+results are memoized.
 """
 from __future__ import annotations
 
+import heapq
+
 from .chain import (
-    MAX_PATH_DEPTH,
     check_eku,
     check_name_constraints,
     check_path_len,
@@ -39,6 +45,7 @@ class PathFinder:
         self.edges_seen: set[tuple[str, str]] = set()
         self._last_good: dict | None = None
         self._intrinsic_cache: dict[tuple[str, bool], dict | None] = {}
+        self._parents_cache: dict[str, list[str]] = {}
 
     # --------------------------------------------------------------- nodes
     def _node_intrinsic(self, fp: str, as_issuer: bool) -> dict | None:
@@ -71,12 +78,14 @@ class PathFinder:
                            "selected_evidence": res["selected_evidence"]}
             if res["conclusion"] != "GOOD":
                 return {"rule": "REVOCATION",
-                        "detail": {"at": fp, "conclusion": res["conclusion"]}}, details
+                        "at": fp,
+                        "conclusion": res["conclusion"]}, details
         return None, details
 
     # ----------------------------------------------------------------- API
     def find(self, leaf_fp: str) -> dict:
         self._intrinsic_cache: dict[tuple[str, bool], dict | None] = {}
+        self._parents_cache: dict[str, list[str]] = {}
         if self.g.get_cert(leaf_fp) is None:
             return {"status": "REJECTED",
                     "reason": {"rule": "LEAF_NOT_IN_EVIDENCE_SET"},
@@ -90,12 +99,9 @@ class PathFinder:
                     "policy_trace": [], "revocation": {},
                     "rejection_proof": None}
 
-        winner = None
-        for depth in range(1, MAX_PATH_DEPTH + 1):
-            self._last_good = None
-            if self._dfs(leaf_fp, (leaf_fp,), depth):
-                winner = self._last_good
-                break
+        self._last_good = None
+        self._search(leaf_fp)
+        winner = self._last_good
         if winner is not None:
             return {"status": "ACCEPTED", "reason": None,
                     "selected_path": winner["path"],
@@ -120,9 +126,12 @@ class PathFinder:
             terminal = self.node_failures.get(leaf_fp) or {"rule": "NO_PATH_TO_ANCHOR"}
         return self._reject(leaf_fp, terminal)
 
-    # ----------------------------------------------------------------- DFS
+    # -------------------------------------------------------------- search
     def _static_parents(self, fp: str) -> list[str]:
         """Name/key- and signature-valid issuer fingerprints (sorted)."""
+        cached = self._parents_cache.get(fp)
+        if cached is not None:
+            return cached
         out: list[str] = []
         for ip in self.g.candidate_issuers(fp):
             self.edges_seen.add((fp, ip))
@@ -134,25 +143,36 @@ class PathFinder:
                                               {"rule": e.sig_rule or "SIGNATURE"})
             else:
                 out.append(ip)
-        return sorted(out)
+        out.sort()
+        self._parents_cache[fp] = out
+        return out
 
-    def _dfs(self, fp: str, stack: tuple[str, ...], remaining: int) -> bool:
-        for ip in self._static_parents(fp):
-            if ip in stack:
-                self.edge_failures.setdefault((fp, ip), {"rule": "LOOP"})
-                continue
-            nf = self._node_intrinsic(ip, as_issuer=True)
-            if nf is not None:
-                self.edge_failures.setdefault((fp, ip), nf)
-                continue
-            if ip in self.anchors:
-                path = stack + (ip,)
+    def _search(self, leaf_fp: str) -> None:
+        """Best-first enumeration of simple paths from the leaf in
+        (certificate count, fingerprint sequence) order; sets
+        ``self._last_good`` on the first complete anchor path that passes
+        every gate. Returns only when a winner is found or the reachable
+        candidate space is exhausted: the on-path set blocks cycles, so
+        every queued path is finite and the frontier eventually empties.
+        There is no depth cap beyond the graph itself."""
+        frontier: list[tuple[int, tuple[str, ...]]] = [(1, (leaf_fp,))]
+        while frontier:
+            _, path = heapq.heappop(frontier)
+            last = path[-1]
+            if last in self.anchors:
                 if self._complete_path(path) is None:
-                    return True
+                    return
                 continue
-            if remaining > 1 and self._dfs(ip, stack + (ip,), remaining - 1):
-                return True
-        return False
+            on_path = set(path)
+            for ip in self._static_parents(last):
+                if ip in on_path:
+                    self.edge_failures.setdefault((last, ip), {"rule": "LOOP"})
+                    continue
+                nf = self._node_intrinsic(ip, as_issuer=True)
+                if nf is not None:
+                    self.edge_failures.setdefault((last, ip), nf)
+                    continue
+                heapq.heappush(frontier, (len(path) + 1, path + (ip,)))
 
     def _complete_path(self, path: tuple[str, ...]):
         rev_fail, rev_details = self._revocation_gate(list(path))
@@ -218,10 +238,8 @@ class PathFinder:
         parents_of: dict[str, set[str]] = {}
         for (c, p) in self.edges_seen:
             parents_of.setdefault(c, set()).add(p)
-        # Reverse reachability to any anchor over valid static edges.
-        can: set[str] = set(a for a in self.anchors if any(
-            a in ps for ps in parents_of.values()) or a == next(iter(parents_of), None))
-        can = set(self.anchors)
+        # Reverse reachability to any anchor over explored edges.
+        can: set[str] = set(self.anchors)
         children_of: dict[str, set[str]] = {}
         for c, ps in parents_of.items():
             for p in ps:

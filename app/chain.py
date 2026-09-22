@@ -27,10 +27,7 @@ RULE_ORDER = [
     "REVOCATION",
     "ANCHOR",
     "LOOP",
-    "PATH_DEPTH",
 ]
-
-MAX_PATH_DEPTH = 20
 
 
 def dns_in_subtree(host: str, constraint: str) -> bool:
